@@ -3,7 +3,6 @@ package zapsentry
 import (
 	"fmt"
 	"net/http"
-	"reflect"
 	"strings"
 	"time"
 
@@ -45,6 +44,7 @@ const (
 	ServerNameKey  = "server_name"
 	ErrorKey       = "error"
 	HTTPRequestKey = "http_request"
+	SentryUserKey  = "sentry_user"
 )
 
 const ErrorStackTraceKey = "error_stack_trace"
@@ -128,6 +128,15 @@ func (core *Core) Check(entry zapcore.Entry, checked *zapcore.CheckedEntry) *zap
 }
 
 func (core *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
+	// When set, relevant Sentry interfaces are added.
+	var (
+		err error
+		req *http.Request
+		user *sentry.User
+	)
+
+	//hub := sentry.CurrentHub()
+	hub := sentry.CurrentHub().Clone()
 	// Create a Sentry Event.
 	event := sentry.NewEvent()
 	event.Message = entry.Message
@@ -136,16 +145,9 @@ func (core *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 	// Process entry.
 	event.Level = zapLevelToSentrySeverity[entry.Level]
 	event.Timestamp = entry.Time.Unix()
-	event.Logger = entry.LoggerName
 
 	// Process fields.
 	encoder := zapcore.NewMapObjectEncoder()
-
-	// When set, relevant Sentry interfaces are added.
-	var (
-		err error
-		req *http.Request
-	)
 
 	// processField processes the given field.
 	// When false is returned, the whole entry is to be skipped.
@@ -157,6 +159,9 @@ func (core *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 
 		case PlatformKey:
 			event.Platform = field.String
+
+		case SentryUserKey:
+			user = field.Interface.(*sentry.User)
 
 		case ServerNameKey:
 			event.ServerName = field.String
@@ -223,71 +228,20 @@ func (core *Core) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 		}
 	}
 
-	if err != nil {
-		// In case an error object is present, create an exception.
-		// Capture the stack trace in any case.
-		stacktrace := sentry.ExtractStacktrace(err)
-		if stacktrace == nil {
-			stacktrace = sentry.NewStacktrace()
+	hub.WithScope(func(scope *sentry.Scope) {
+		if req != nil {
+			scope.SetRequest(sentry.Request{}.FromHTTPRequest(req))
 		}
-		// Handle wrapped errors for github.com/pingcap/errors and github.com/pkg/errors
-		cause := errors.Cause(err)
-		event.Exception = []sentry.Exception{{
-			Value:      cause.Error(),
-			Type:       reflect.TypeOf(cause).String(),
-			Stacktrace: stacktrace,
-		}}
-	} else {
-		stacktrace := sentry.NewStacktrace()
-		stacktrace.Frames = filterFrames(stacktrace.Frames)
-		event.Exception = []sentry.Exception{{
-			Value:      entry.Message,
-			Stacktrace: stacktrace,
-		}}
-	}
-
-	// In case an HTTP request is present, add the HTTP interface.
-	if req != nil {
-		var request sentry.Request
-		request.FromHTTPRequest(req)
-		event.Request = request
-	}
-
-	// Add tags and extra into the packet.
-	if len(tags) != 0 {
-		event.Tags = tags
-	}
-	if len(extra) != 0 {
-		event.Extra = extra
-	}
-
-	hub := sentry.CurrentHub()
-	// Capture the packet.
-	_ = core.client.CaptureEvent(event, nil, hub.Scope())
+		scope.SetUser(*user)
+		scope.SetTags(tags)
+		scope.SetExtras(extra)
+		if err != nil {
+			hub.CaptureException(err)
+		} else {
+			hub.CaptureEvent(event)
+		}
+	})
 	return nil
-}
-
-func filterFrames(frames []sentry.Frame) []sentry.Frame {
-	if len(frames) == 0 {
-		return nil
-	}
-
-	filteredFrames := make([]sentry.Frame, 0, len(frames))
-
-	for _, frame := range frames {
-		// Skip Zap internal code in the frames.
-		if strings.HasPrefix(frame.Function, "go.uber.org/zap") {
-			continue
-		}
-		// Skip zapsentry code in the frames.
-		if strings.HasPrefix(frame.Module, "github.com/tchap/zapext") &&
-			!strings.HasSuffix(frame.Module, "_test") {
-			continue
-		}
-		filteredFrames = append(filteredFrames, frame)
-	}
-
-	return filteredFrames
 }
 
 func (core *Core) Sync() error {
